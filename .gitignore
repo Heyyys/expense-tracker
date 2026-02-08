@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Database (user data — each deployment has its own)
+expenses.db
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Temp files
+temp_audio.wav

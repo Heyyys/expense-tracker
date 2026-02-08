@@ -1,0 +1,12 @@
+streamlit==1.54.0
+pandas==2.3.3
+easyocr==1.7.2
+python-dotenv==1.1.1
+langchain-openai==1.1.7
+langchain-core==1.2.9
+pydantic==2.11.10
+openai-whisper==20250625
+torch==2.10.0
+torchaudio==2.10.0
+PyMuPDF==1.26.7
+requests==2.32.5
