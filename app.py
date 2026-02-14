@@ -184,6 +184,8 @@ TRANSLATIONS = {
         "save_changes": "Save Changes",
         "save_changes_success": "{count} expense(s) updated.",
         "save_changes_none": "No changes detected.",
+        "missing_api_key_title": "API key missing",
+        "missing_api_key_body": "Set XAI_API_KEY in Streamlit Secrets (or .env locally) to enable AI parsing.",
     },
     "zh-TW": {
         "page_title": "AI 記帳助手",
@@ -277,6 +279,8 @@ TRANSLATIONS = {
         "save_changes": "儲存修改",
         "save_changes_success": "已更新 {count} 筆支出。",
         "save_changes_none": "未偵測到任何變更。",
+        "missing_api_key_title": "缺少 API 金鑰",
+        "missing_api_key_body": "請在 Streamlit Secrets 設定 XAI_API_KEY（本機可用 .env）。",
     },
 }
 
@@ -386,6 +390,20 @@ if not os.getenv("XAI_API_KEY") and os.path.exists(_env_path):
             _line = _line.strip()
             if _line.startswith("XAI_API_KEY=") or _line.startswith("xAI_API_KEY="):
                 os.environ["XAI_API_KEY"] = _line.split("=", 1)[1]
+
+def _get_xai_api_key() -> str | None:
+    key = os.getenv("XAI_API_KEY") or os.getenv("xAI_API_KEY")
+    if not key:
+        try:
+            key = (st.secrets.get("XAI_API_KEY")
+                   or st.secrets.get("xAI_API_KEY")
+                   or st.secrets.get("OPENAI_API_KEY"))
+        except Exception:
+            key = None
+    if key:
+        os.environ["XAI_API_KEY"] = key
+        os.environ["OPENAI_API_KEY"] = key
+    return key
 
 # ========================
 # Device detection
@@ -635,10 +653,16 @@ def try_local_parse(text: str) -> Expense | None:
 # ========================
 # LLM (API fallback)
 # ========================
+_xai_api_key = _get_xai_api_key()
+if not _xai_api_key:
+    st.error(f"🚫 {t('missing_api_key_title')}")
+    st.info(t("missing_api_key_body"))
+    st.stop()
+
 llm = ChatOpenAI(
     model="grok-3-mini-fast",
     temperature=0,
-    api_key=os.getenv("XAI_API_KEY") or os.getenv("xAI_API_KEY") or st.secrets.get("XAI_API_KEY", None),
+    api_key=_xai_api_key,
     base_url="https://api.x.ai/v1",
 )
 
