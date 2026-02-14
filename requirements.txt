@@ -10,3 +10,4 @@ torch
 torchaudio
 PyMuPDF
 requests
+libsql

@@ -5,6 +5,7 @@ st.set_page_config(page_title="Expense Tracker AI Agent", layout="centered")
 
 import pandas as pd
 import sqlite3
+import libsql
 from datetime import datetime
 import os
 import re
@@ -42,10 +43,32 @@ except ImportError:
     HAS_PDF = False
 
 # ========================
-# Database (shared for all users)
+# Database (Turso cloud DB if credentials available, else local SQLite)
 # ========================
-_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expenses.db')
-conn = sqlite3.connect(_db_path, check_same_thread=False)
+def _get_secret(key: str) -> str | None:
+    """Read a secret from st.secrets or environment variables."""
+    val = os.getenv(key)
+    if not val:
+        try:
+            val = st.secrets.get(key)
+        except Exception:
+            val = None
+    return val
+
+_turso_url = _get_secret("TURSO_DATABASE_URL")
+_turso_token = _get_secret("TURSO_AUTH_TOKEN")
+
+if _turso_url and _turso_token:
+    # Cloud mode: connect to Turso (persistent)
+    _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'local_replica.db')
+    conn = libsql.connect(_db_path, sync_url=_turso_url, auth_token=_turso_token)
+    conn.sync()
+    _USING_CLOUD_DB = True
+else:
+    # Local mode: plain SQLite file
+    _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expenses.db')
+    conn = sqlite3.connect(_db_path, check_same_thread=False)
+    _USING_CLOUD_DB = False
 
 # Users table
 conn.execute('''CREATE TABLE IF NOT EXISTS users
@@ -67,23 +90,31 @@ conn.execute('''CREATE TABLE IF NOT EXISTS expenses
                  items TEXT,
                  source TEXT)''')
 conn.commit()
+if _USING_CLOUD_DB:
+    conn.sync()
 
 # Migrate: add username column if missing (for existing DBs)
 try:
     conn.execute("ALTER TABLE expenses ADD COLUMN username TEXT DEFAULT ''")
     conn.commit()
-except sqlite3.OperationalError:
+except (sqlite3.OperationalError, Exception):
     pass
 try:
     conn.execute("ALTER TABLE expenses ADD COLUMN currency TEXT DEFAULT 'HKD'")
     conn.commit()
-except sqlite3.OperationalError:
+except (sqlite3.OperationalError, Exception):
     pass
 try:
     conn.execute("ALTER TABLE expenses ADD COLUMN amount_hkd REAL")
     conn.commit()
-except sqlite3.OperationalError:
+except (sqlite3.OperationalError, Exception):
     pass
+
+def _commit():
+    """Commit and sync to cloud DB if using Turso."""
+    conn.commit()
+    if _USING_CLOUD_DB:
+        conn.sync()
 
 # ========================
 # Auth helpers
@@ -97,10 +128,12 @@ def register_user(username: str, password: str) -> bool:
     try:
         conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
                      (username.strip().lower(), _hash_password(password)))
-        conn.commit()
+        _commit()
         return True
-    except sqlite3.IntegrityError:
-        return False  # Username already exists
+    except (sqlite3.IntegrityError, Exception) as e:
+        if "UNIQUE" in str(e).upper() or "IntegrityError" in type(e).__name__:
+            return False  # Username already exists
+        return False
 
 def authenticate_user(username: str, password: str) -> bool:
     row = conn.execute("SELECT password_hash FROM users WHERE username = ?",
@@ -908,7 +941,7 @@ def save_expense(date, merchant, category, currency, amount, items, source):
         INSERT INTO expenses (username, date, merchant, category, currency, amount, amount_hkd, items, source)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (CURRENT_USER, date, merchant, category, currency, amount, amount_hkd, items, source))
-    conn.commit()
+    _commit()
     return amount_hkd
 
 # ========================================
@@ -945,7 +978,7 @@ with tab_quick:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (CURRENT_USER, q_date.strftime('%Y-%m-%d'), q_merchant, q_category, q_currency,
                   q_amount, amount_hkd, q_items or q_merchant, "quick_form"))
-            conn.commit()
+            _commit()
             st.session_state.local_parse_count += 1
             _log_stats("FORM", f"{q_merchant} {q_amount} {q_currency}",
                        Expense(date=q_date.strftime('%Y-%m-%d'), merchant=q_merchant,
@@ -1000,7 +1033,7 @@ with tab_free:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (CURRENT_USER, f_date.strftime('%Y-%m-%d'), f_merchant, f_category, f_currency,
                           f_amount, amount_hkd, f_items or f_merchant, "free_text"))
-                    conn.commit()
+                    _commit()
                     st.session_state.local_parse_count += 1
                     _log_stats("FREE TEXT", f"{f_merchant} {f_amount} {f_currency}",
                                Expense(date=f_date.strftime('%Y-%m-%d'), merchant=f_merchant,
@@ -1238,7 +1271,7 @@ if not raw_df.empty:
                           float(ed['amount']), new_amount_hkd, ed['items'], int(row_id), CURRENT_USER))
                     update_count += 1
             if update_count > 0:
-                conn.commit()
+                _commit()
                 st.success(t("save_changes_success", count=update_count))
                 st.rerun()
             else:
@@ -1253,7 +1286,7 @@ if not raw_df.empty:
                 placeholders = ','.join('?' * len(ids_to_delete))
                 conn.execute(f"DELETE FROM expenses WHERE id IN ({placeholders}) AND username = ?",
                              ids_to_delete + [CURRENT_USER])
-                conn.commit()
+                _commit()
                 st.success(t("delete_success", count=len(ids_to_delete)))
                 st.rerun()
             else:
