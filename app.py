@@ -11,14 +11,35 @@ import re
 import json
 import hashlib
 import requests
-import easyocr
-import fitz  # PyMuPDF — for PDF to image conversion
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
-import whisper
-import torch
+
+# Heavy ML imports — graceful fallback if unavailable (e.g. Streamlit Cloud memory limits)
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    import easyocr
+    HAS_OCR = True
+except ImportError:
+    HAS_OCR = False
+
+try:
+    import whisper
+    HAS_WHISPER = True
+except ImportError:
+    HAS_WHISPER = False
+
+try:
+    import fitz  # PyMuPDF — for PDF to image conversion
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
 
 # ========================
 # Database (shared for all users)
@@ -416,26 +437,33 @@ def _get_xai_api_key() -> str | None:
 # ========================
 # Device detection
 # ========================
-if torch.backends.mps.is_available():
-    DEVICE = "mps"
-elif torch.cuda.is_available():
-    DEVICE = "cuda"
+if HAS_TORCH:
+    if torch.backends.mps.is_available():
+        DEVICE = "mps"
+    elif torch.cuda.is_available():
+        DEVICE = "cuda"
+    else:
+        DEVICE = "cpu"
 else:
     DEVICE = "cpu"
 
 # ========================
-# Model loading (cached)
+# Model loading (cached) — only if available
 # ========================
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['en', 'ch_tra'], gpu=torch.cuda.is_available())
+reader = None
+whisper_model = None
 
-@st.cache_resource
-def load_whisper_model():
-    return whisper.load_model("base", device=DEVICE)
+if HAS_OCR:
+    @st.cache_resource
+    def load_ocr_reader():
+        return easyocr.Reader(['en', 'ch_tra'], gpu=(HAS_TORCH and torch.cuda.is_available()))
+    reader = load_ocr_reader()
 
-reader = load_ocr_reader()
-whisper_model = load_whisper_model()
+if HAS_WHISPER:
+    @st.cache_resource
+    def load_whisper_model():
+        return whisper.load_model("base", device=DEVICE)
+    whisper_model = load_whisper_model()
 
 # ========================
 # FX Rates
@@ -983,10 +1011,12 @@ with tab_free:
 
 # === Photo Receipt Tab ===
 with tab1:
-    uploaded_file = st.file_uploader(t("upload_label"), type=['png', 'jpg', 'jpeg', 'pdf'])
+    if not HAS_OCR:
+        st.warning("OCR is not available in this deployment (EasyOCR not installed). Use Quick Form or Free Text instead.")
+    uploaded_file = st.file_uploader(t("upload_label"), type=['png', 'jpg', 'jpeg', 'pdf']) if HAS_OCR else None
     if uploaded_file:
         file_bytes = uploaded_file.getvalue()
-        is_pdf = uploaded_file.name.lower().endswith('.pdf')
+        is_pdf = HAS_PDF and uploaded_file.name.lower().endswith('.pdf')
 
         with st.spinner(t("spinner_ocr")):
             if is_pdf:
@@ -1078,7 +1108,9 @@ with tab1:
 
 # === Voice Input Tab ===
 with tab2:
-    audio_bytes = st.audio_input(t("voice_label"))
+    if not HAS_WHISPER:
+        st.warning("Voice input is not available in this deployment (Whisper not installed). Use Quick Form or Free Text instead.")
+    audio_bytes = st.audio_input(t("voice_label")) if HAS_WHISPER else None
     if audio_bytes:
         temp_path = "temp_audio.wav"
         with open(temp_path, "wb") as f:
