@@ -186,6 +186,10 @@ TRANSLATIONS = {
         "save_changes_none": "No changes detected.",
         "missing_api_key_title": "API key missing",
         "missing_api_key_body": "Set XAI_API_KEY in Streamlit Secrets (or .env locally) to enable AI parsing.",
+        "multi_found": "Found **{count}** transaction(s). Review and edit below, then save.",
+        "multi_save_all": "Save All ({count})",
+        "multi_saved": "Saved {count} expense(s)!",
+        "multi_remove": "Remove",
     },
     "zh-TW": {
         "page_title": "AI 記帳助手",
@@ -281,6 +285,10 @@ TRANSLATIONS = {
         "save_changes_none": "未偵測到任何變更。",
         "missing_api_key_title": "缺少 API 金鑰",
         "missing_api_key_body": "請在 Streamlit Secrets 設定 XAI_API_KEY（本機可用 .env）。",
+        "multi_found": "找到 **{count}** 筆交易，請在下方檢查並編輯後儲存。",
+        "multi_save_all": "全部儲存（{count}筆）",
+        "multi_saved": "已儲存 {count} 筆支出！",
+        "multi_remove": "移除",
     },
 }
 
@@ -731,6 +739,140 @@ def parse_expense_only(text: str):
 
     return expense, used_api
 
+def try_local_parse_multi(text: str) -> list[dict]:
+    """Try to split OCR text into multiple transaction lines and parse each one locally.
+    Handles Apple Pay / Wallet transaction lists where each line has merchant + amount."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    results = []
+
+    # Pattern: a line that contains both a merchant-like name and a monetary amount
+    # e.g. "Starbucks $45.00", "McDonald's HK$32.50", "MTR 12.00", "7-Eleven -$28.00"
+    line_pattern = re.compile(
+        r'^(.+?)\s+'                                         # merchant name
+        r'[-]?\s*(?:NT\$?|HK\$?|US\$?|SG\$?|RM|€|£|\$)?\s*' # optional currency symbol
+        r'(\d+(?:[,]\d{3})*(?:\.\d+)?)\s*'                   # amount
+        r'(?:TWD|HKD|USD|CNY|JPY|EUR|GBP|SGD|KRW|MYR)?$',    # optional currency code
+        re.IGNORECASE
+    )
+    # Also match: amount first, then merchant  (e.g. "$45.00 Starbucks")
+    line_pattern_rev = re.compile(
+        r'^[-]?\s*(?:NT\$?|HK\$?|US\$?|SG\$?|RM|€|£|\$)\s*'
+        r'(\d+(?:[,]\d{3})*(?:\.\d+)?)\s+'
+        r'(.+?)$',
+        re.IGNORECASE
+    )
+
+    # Try to detect a date on a nearby line
+    current_date = today
+    for line in lines:
+        # Check if line is a date header (e.g. "2025-12-01", "Jan 15, 2025", "12/01")
+        date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', line)
+        if date_match:
+            try:
+                parsed = datetime.strptime(date_match.group(1).replace('/', '-'), '%Y-%m-%d')
+                current_date = parsed.strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+            continue
+
+        # Match "merchant amount" pattern
+        m = line_pattern.match(line)
+        if m:
+            merchant = m.group(1).strip().rstrip('-–— ')
+            amount = float(m.group(2).replace(',', ''))
+            if amount <= 0 or amount > 999999:
+                continue
+            currency = detect_currency(line)
+            results.append({
+                "date": current_date, "merchant": merchant,
+                "items": merchant, "currency": currency,
+                "amount": amount, "category": guess_category(line),
+            })
+            continue
+
+        # Match "amount merchant" pattern
+        m2 = line_pattern_rev.match(line)
+        if m2:
+            amount = float(m2.group(1).replace(',', ''))
+            merchant = m2.group(2).strip().rstrip('-–— ')
+            if amount <= 0 or amount > 999999:
+                continue
+            currency = detect_currency(line)
+            results.append({
+                "date": current_date, "merchant": merchant,
+                "items": merchant, "currency": currency,
+                "amount": amount, "category": guess_category(line),
+            })
+
+    return results
+
+def parse_multi_with_api(text: str) -> list[dict]:
+    """Use the LLM to extract multiple expenses from OCR text."""
+    cache_key = "multi_" + hashlib.md5(text.encode()).hexdigest()
+    if cache_key in st.session_state.parse_cache:
+        st.session_state.cache_hit_count += 1
+        return st.session_state.parse_cache[cache_key]
+
+    prompt = f"""Extract ALL individual expenses/transactions from this text as a JSON array.
+Each item: {{"date":"YYYY-MM-DD","merchant":"name","category":"Food|Transport|Shopping|Entertainment|Groceries|Utilities|Health|Other","currency":"HKD|TWD|USD|CNY|JPY|EUR|GBP|SGD|KRW|MYR","amount":0.0,"items":"description"}}
+Today: {datetime.now().strftime('%Y-%m-%d')}
+Text:
+{text}
+Return ONLY a JSON array: [{{...}}, {{...}}]"""
+
+    try:
+        result = llm.invoke(prompt)
+        content = result.content.strip()
+        if "```" in content:
+            content = re.search(r'```(?:json)?\s*(.*?)```', content, re.DOTALL).group(1).strip()
+        data = json.loads(content)
+        if isinstance(data, dict):
+            data = [data]  # Single result wrapped
+        expenses = []
+        for item in data:
+            try:
+                e = Expense(**item)
+                expenses.append({
+                    "date": e.date, "merchant": e.merchant, "items": e.items,
+                    "currency": e.currency, "amount": e.amount, "category": e.category,
+                })
+            except Exception:
+                continue
+        st.session_state.parse_cache[cache_key] = expenses
+        st.session_state.api_call_count += 1
+        _log_stats("API MULTI", f"{len(expenses)} expenses from text", None)
+        return expenses
+    except Exception as e:
+        st.session_state.api_call_count += 1
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [API MULTI ERROR] [{CURRENT_USER}] {str(e)}")
+        return []
+
+def parse_photo_expenses(text: str) -> tuple[list[dict], bool]:
+    """Parse OCR text — try local multi-line first, fall back to API multi-parse."""
+    results = try_local_parse_multi(text)
+    if results:
+        st.session_state.local_parse_count += 1
+        _log_stats("LOCAL MULTI", f"{len(results)} expenses", None)
+        return results, False
+
+    # If local multi didn't find anything, try single local parse
+    single = try_local_parse(text)
+    if single:
+        st.session_state.local_parse_count += 1
+        _log_stats("LOCAL SINGLE", text, single)
+        return [{
+            "date": single.date, "merchant": single.merchant, "items": single.items,
+            "currency": single.currency, "amount": single.amount, "category": single.category,
+        }], False
+
+    # Fall back to API multi-parse
+    api_results = parse_multi_with_api(text)
+    if api_results:
+        return api_results, True
+
+    return [], True
+
 def save_expense(date, merchant, category, currency, amount, items, source):
     """Save a validated expense to the database."""
     amount_hkd = convert_to_hkd(amount, currency)
@@ -869,55 +1011,70 @@ with tab1:
         st.write(t("extracted_text"))
         st.code(extracted_text)
 
-        # Step 1: Parse — store result for review
+        # Step 1: Parse — detect multiple transactions
         if st.button(f"🧠 {t('btn_parse_review')}"):
             with st.spinner(t("spinner_ai")):
-                expense, used_api = parse_expense_only(extracted_text)
-                if expense:
-                    st.session_state.photo_parsed = {
-                        "merchant": expense.merchant, "items": expense.items,
-                        "currency": expense.currency, "amount": expense.amount,
-                        "category": expense.category, "date": expense.date,
-                    }
+                expenses_list, used_api = parse_photo_expenses(extracted_text)
+                if expenses_list:
+                    st.session_state.photo_multi = expenses_list
                     st.session_state.photo_used_api = used_api
                 else:
-                    st.session_state.photo_parsed = {
-                        "merchant": "", "items": extracted_text[:50],
-                        "currency": "HKD", "amount": 0.0,
-                        "category": "Other", "date": datetime.now().strftime('%Y-%m-%d'),
-                    }
+                    # Fallback: empty single row for manual entry
+                    st.session_state.photo_multi = [{
+                        "date": datetime.now().strftime('%Y-%m-%d'), "merchant": "",
+                        "items": extracted_text[:50], "currency": "HKD",
+                        "amount": 0.0, "category": "Other",
+                    }]
                     st.session_state.photo_used_api = used_api
 
-        # Step 2: Editable review form
-        if "photo_parsed" in st.session_state:
-            p = st.session_state.photo_parsed
+        # Step 2: Editable review table for all parsed transactions
+        if "photo_multi" in st.session_state:
+            expenses_list = st.session_state.photo_multi
             st.info(t("review_parsed_local") if not st.session_state.get("photo_used_api") else t("review_parsed_api"))
-            with st.form("photo_review_form", clear_on_submit=True):
-                st.markdown(f"**{t('review_header')}**")
-                pc1, pc2 = st.columns(2)
-                with pc1:
-                    p_merchant = st.text_input(t("quick_merchant"), value=p["merchant"])
-                    p_items = st.text_input(t("quick_items"), value=p["items"])
-                    p_date = st.date_input(t("quick_date"),
-                                           value=datetime.strptime(p["date"], '%Y-%m-%d') if p["date"] else datetime.now())
-                with pc2:
-                    p_currency = st.selectbox(t("quick_currency"), SUPPORTED_CURRENCIES,
-                                              index=SUPPORTED_CURRENCIES.index(p["currency"]) if p["currency"] in SUPPORTED_CURRENCIES else 0)
-                    p_amount = st.number_input(t("quick_amount"), value=p["amount"], min_value=0.0, step=1.0, format="%.2f")
-                    p_category = st.selectbox(t("quick_category"), CATEGORIES,
-                                              index=CATEGORIES.index(p["category"]) if p["category"] in CATEGORIES else len(CATEGORIES) - 1)
+            st.success(t("multi_found", count=len(expenses_list)))
 
-                if st.form_submit_button(f"💾 {t('review_save')}"):
-                    if p_merchant and p_amount > 0:
-                        amount_hkd = save_expense(p_date.strftime('%Y-%m-%d'), p_merchant, p_category,
-                                                  p_currency, p_amount, p_items or p_merchant, "receipt_photo")
-                        _log_stats("PHOTO", f"{p_merchant} {p_amount} {p_currency}",
-                                   Expense(date=p_date.strftime('%Y-%m-%d'), merchant=p_merchant,
-                                           category=p_category, currency=p_currency, amount=p_amount, items=p_items or p_merchant))
-                        st.success(t("success_added", merchant=p_merchant, amount=p_amount,
-                                     currency=p_currency, amount_hkd=amount_hkd,
-                                     category=p_category, date=p_date.strftime('%Y-%m-%d')))
-                        del st.session_state.photo_parsed
+            # Build an editable dataframe
+            review_df = pd.DataFrame(expenses_list)
+            # Add a checkbox to include/exclude rows
+            review_df.insert(0, '✓', True)
+            # Ensure column order
+            for col in ['date', 'merchant', 'items', 'currency', 'amount', 'category']:
+                if col not in review_df.columns:
+                    review_df[col] = ''
+
+            edited_review = st.data_editor(
+                review_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                column_config={
+                    '✓': st.column_config.CheckboxColumn('✓', default=True),
+                    'date': st.column_config.TextColumn('date'),
+                    'merchant': st.column_config.TextColumn('merchant'),
+                    'items': st.column_config.TextColumn('items'),
+                    'currency': st.column_config.SelectboxColumn('currency', options=SUPPORTED_CURRENCIES),
+                    'amount': st.column_config.NumberColumn('amount', min_value=0.0, step=1.0, format="%.2f"),
+                    'category': st.column_config.SelectboxColumn('category', options=CATEGORIES),
+                },
+                key="photo_multi_editor",
+            )
+
+            # Save all checked rows
+            if st.button(f"💾 {t('multi_save_all', count=int(edited_review['✓'].sum()))}",
+                         type="primary"):
+                saved_count = 0
+                for _, row in edited_review.iterrows():
+                    if row['✓'] and row.get('merchant') and float(row.get('amount', 0)) > 0:
+                        amount_hkd = save_expense(
+                            str(row['date']), str(row['merchant']), str(row['category']),
+                            str(row['currency']), float(row['amount']),
+                            str(row['items']) or str(row['merchant']), "receipt_photo"
+                        )
+                        saved_count += 1
+                if saved_count > 0:
+                    st.success(t("multi_saved", count=saved_count))
+                    del st.session_state.photo_multi
+                    st.rerun()
 
 # === Voice Input Tab ===
 with tab2:
