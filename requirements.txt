@@ -1,13 +1,9 @@
 streamlit>=1.38.0
 pandas
-easyocr
 python-dotenv
 langchain-openai
 langchain-core
 pydantic
-openai-whisper
-torch
-torchaudio
 PyMuPDF
 requests
 libsql

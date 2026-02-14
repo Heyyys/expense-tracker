@@ -5,8 +5,13 @@ st.set_page_config(page_title="Expense Tracker AI Agent", layout="centered")
 
 import pandas as pd
 import sqlite3
-import libsql
 from datetime import datetime
+
+try:
+    import libsql
+    HAS_LIBSQL = True
+except ImportError:
+    HAS_LIBSQL = False
 import os
 import re
 import json
@@ -58,7 +63,7 @@ def _get_secret(key: str) -> str | None:
 _turso_url = _get_secret("TURSO_DATABASE_URL")
 _turso_token = _get_secret("TURSO_AUTH_TOKEN")
 
-if _turso_url and _turso_token:
+if HAS_LIBSQL and _turso_url and _turso_token:
     # Cloud mode: connect to Turso (persistent)
     _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'local_replica.db')
     conn = libsql.connect(_db_path, sync_url=_turso_url, auth_token=_turso_token)
